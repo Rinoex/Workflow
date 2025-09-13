@@ -1,0 +1,129 @@
+name: Pack ESC-RANK (LoRA, English)
+
+on:
+  workflow_dispatch:
+    inputs:
+      include_base:
+        description: "Also pack base model internlm2-chat-7b"
+        required: true
+        default: "false"
+      dims:
+        description: "Which LoRA dirs to include (comma-separated). Default is all *_en"
+        required: false
+        default: "overall_en,empathic_en,fluency_en,tech_en,diversity_en,suggestion_en,human_en"
+      tag:
+        description: "Release tag (optional)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write  # 允许创建 Release 和上传资产
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (just to have a repo context)
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install -U huggingface_hub
+
+      - name: Download ESC-RANK LoRA (English)
+        id: dl_esc
+        env:
+          DIMS: ${{ github.event.inputs.dims }}
+        run: |
+          python - << 'PY'
+          from huggingface_hub import snapshot_download
+          import os, json, pathlib, hashlib, tarfile, time
+
+          repo_id = "haidequanbu/ESC-RANK"
+          local_dir = "ESC-RANK"
+          dims = [s.strip() for s in os.environ.get("DIMS","").split(",") if s.strip()]
+          allow = [f"{d}/*" for d in dims] + ["README.md",".gitattributes","config.json"]
+
+          print("[INFO] Downloading ESC-RANK subsets:", dims)
+          snapshot_download(
+              repo_id=repo_id,
+              local_dir=local_dir,
+              local_dir_use_symlinks=False,
+              allow_patterns=allow
+          )
+
+          # 打包（gzip 通用性最好）
+          esc_tgz = "ESC-RANK_en_lora.tar.gz"
+          with tarfile.open(esc_tgz, "w:gz") as tar:
+              tar.add(local_dir, arcname="ESC-RANK")
+          print("[OK] Packed", esc_tgz)
+
+          # sha256
+          import hashlib
+          def sha256sum(p):
+              h = hashlib.sha256()
+              with open(p, "rb") as f:
+                  for chunk in iter(lambda: f.read(1<<20), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+          with open(esc_tgz + ".sha256","w") as w:
+              w.write(f"{sha256sum(esc_tgz)}  {esc_tgz}\n")
+          print("[OK] Wrote", esc_tgz + ".sha256")
+          PY
+
+      - name: (Optional) Download base model
+        if: ${{ github.event.inputs.include_base == 'true' }}
+        run: |
+          python - << 'PY'
+          from huggingface_hub import snapshot_download
+          import tarfile, hashlib
+
+          base_repo = "internlm/internlm2-chat-7b"
+          base_dir = "internlm2-chat-7b"
+          snapshot_download(
+              repo_id=base_repo,
+              local_dir=base_dir,
+              local_dir_use_symlinks=False
+          )
+          base_tgz = "internlm2-chat-7b.tar.gz"
+          with tarfile.open(base_tgz, "w:gz") as tar:
+              tar.add(base_dir, arcname="internlm2-chat-7b")
+          import hashlib
+          def sha256sum(p):
+              h = hashlib.sha256()
+              with open(p, "rb") as f:
+                  for chunk in iter(lambda: f.read(1<<20), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+          with open(base_tgz + ".sha256","w") as w:
+              w.write(f"{sha256sum(base_tgz)}  {base_tgz}\n")
+          print("[OK] Packed base + sha256")
+          PY
+
+      - name: Compute tag
+        id: maketag
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=esc-rank-$(date +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
+          fi
+          echo "Using tag: $(cat $GITHUB_OUTPUT)"
+
+      - name: Create GitHub Release & upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.maketag.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            ESC-RANK_en_lora.tar.gz
+            ESC-RANK_en_lora.tar.gz.sha256
+            internlm2-chat-7b.tar.gz
+            internlm2-chat-7b.tar.gz.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
