@@ -1,0 +1,80 @@
+name: Pack & Push ESC-Role to My S3
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  pack_and_push:
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_KEY }}
+      AWS_DEFAULT_REGION: us-east-1   # 任意占位
+      ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install HF CLI with transfer accel
+        run: |
+          python -m pip install -U "huggingface_hub[hf_transfer]"
+          python -c "import huggingface_hub, sys; print('hub',huggingface_hub.__version__)"
+          # 开启 Rust 下载器加速
+          echo "HF_HUB_ENABLE_HF_TRANSFER=1" >> $GITHUB_ENV
+        # 参考：HF 文档关于 hf_transfer 环境变量  [oai_citation:4‡Hugging Face](https://huggingface.co/docs/huggingface_hub/en/package_reference/environment_variables?utm_source=chatgpt.com)
+
+      - name: Download ESC-Role from Hugging Face
+        run: |
+          set -e
+          # 使用官方 CLI `hf download`（同文档） [oai_citation:5‡Hugging Face](https://huggingface.co/docs/huggingface_hub/en/guides/cli?utm_source=chatgpt.com)
+          hf download haidequanbu/ESC-Role --repo-type model --local-dir ESC-Role
+          echo "Downloaded files:" && find ESC-Role -maxdepth 1 -type f -printf '%f\n' | sort
+
+      - name: Pack & split (<2GiB each)
+        run: |
+          set -e
+          tar -czf ESC-Role.tgz -C ESC-Role .
+          sha256sum ESC-Role.tgz > ESC-Role.tgz.sha256
+          # GitHub Release 单个资产限 2GiB；切片 1.9GiB 更稳
+          split -b 1900m -d -a 3 ESC-Role.tgz ESC-Role.tgz.part-
+          ls -lh ESC-Role.tgz* || true
+
+      - name: Setup s5cmd
+        uses: peak/action-setup-s5cmd@v1
+        with:
+          # 指定稳定版本，示例 v2.2.1（见 s5cmd releases） [oai_citation:6‡GitHub](https://github.com/peak/s5cmd/releases?utm_source=chatgpt.com)
+          version: v2.2.1
+
+      - name: Smoke test S3 connectivity (list bucket)
+        run: |
+          # s5cmd 自定义 endpoint 下默认 path-style，适配 MinIO 等  [oai_citation:7‡GitHub](https://github.com/peak/s5cmd?utm_source=chatgpt.com)
+          s5cmd --version
+          s5cmd --endpoint-url "$ENDPOINT" ls s3://esc-artifacts/ || true
+
+      - name: Upload parts to my S3 (parallel)
+        run: |
+          # 并行高吞吐上传（32 worker 可按带宽调大/调小）
+          s5cmd --numworkers 32 --endpoint-url "$ENDPOINT" \
+            cp ESC-Role.tgz.part-* s3://esc-artifacts/ESC-Role/
+          # 顺带上传校验文件
+          s5cmd --numworkers 16 --endpoint-url "$ENDPOINT" \
+            cp ESC-Role.tgz.sha256 s3://esc-artifacts/ESC-Role/
+
+      - name: Print next steps
+        run: |
+          echo "Uploaded to: $ENDPOINT/esc-artifacts/ESC-Role/"
+          echo "On your server:"
+          cat <<'SH'
+          # 下载 → 合并 → 校验 → 解包
+          # (可用 aria2c 并行下载；以下示例用 s5cmd 从自建 S3 拉回)
+          s5cmd --endpoint-url <ENDPOINT> cp s3://esc-artifacts/ESC-Role/ESC-Role.tgz.part-* .
+          cat ESC-Role.tgz.part-* > ESC-Role.tgz
+          sha256sum -c ESC-Role.tgz.sha256
+          mkdir -p /opt/models/ESC-Role && tar -xzf ESC-Role.tgz -C /opt/models/ESC-Role
+          SH
